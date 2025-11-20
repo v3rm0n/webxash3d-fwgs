@@ -3,6 +3,16 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/gorilla/websocket"
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
@@ -10,15 +20,7 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
-	"github.com/yohimik/goxash3d-fwgs/pkg"
-	"io"
-	"math/rand"
-	"net/http"
-	"os"
-	"path/filepath"
-	"strconv"
-	"sync"
-	"time"
+	goxash3d_fwgs "github.com/yohimik/goxash3d-fwgs/pkg"
 )
 
 var net = NewSFUNet()
@@ -514,6 +516,122 @@ func init() {
 	}
 }
 
+// parseRange parses HTTP Range header
+func parseRange(rangeHeader string, fileSize int64) (start int64, end int64, err error) {
+	if rangeHeader == "" {
+		return 0, fileSize - 1, nil
+	}
+
+	// Range header format: "bytes=start-end"
+	if !strings.HasPrefix(rangeHeader, "bytes=") {
+		return 0, 0, fmt.Errorf("invalid range header")
+	}
+
+	rangeSpec := strings.TrimPrefix(rangeHeader, "bytes=")
+	parts := strings.Split(rangeSpec, "-")
+
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid range format")
+	}
+
+	if parts[0] == "" {
+		// Suffix range: "-500" means last 500 bytes
+		suffixLength, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return 0, 0, err
+		}
+		start = fileSize - suffixLength
+		if start < 0 {
+			start = 0
+		}
+		end = fileSize - 1
+	} else {
+		start, err = strconv.ParseInt(parts[0], 10, 64)
+		if err != nil {
+			return 0, 0, err
+		}
+
+		if parts[1] == "" {
+			// Open-ended range: "500-" means from byte 500 to end
+			end = fileSize - 1
+		} else {
+			end, err = strconv.ParseInt(parts[1], 10, 64)
+			if err != nil {
+				return 0, 0, err
+			}
+		}
+	}
+
+	// Validate range
+	if start < 0 || start >= fileSize || end >= fileSize || start > end {
+		return 0, 0, fmt.Errorf("invalid range values")
+	}
+
+	return start, end, nil
+}
+
+// serveFileChunked serves a file with Range request support for chunked downloads
+func serveFileChunked(w http.ResponseWriter, r *http.Request, path string, fi os.FileInfo) {
+	file, err := os.Open(path)
+	if err != nil {
+		http.Error(w, "Failed to open file", http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+
+	fileSize := fi.Size()
+	modTime := fi.ModTime().UTC()
+
+	// Set common headers
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Last-Modified", modTime.Format(http.TimeFormat))
+	etag := fmt.Sprintf(`"%x-%x"`, fi.ModTime().UnixNano(), fi.Size())
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Content-Type", "application/zip")
+
+	// Handle conditional requests
+	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	if since := r.Header.Get("If-Modified-Since"); since != "" {
+		if t, err := time.Parse(http.TimeFormat, since); err == nil &&
+			modTime.Before(t.Add(1*time.Second)) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
+	// Parse Range header
+	rangeHeader := r.Header.Get("Range")
+	start, end, err := parseRange(rangeHeader, fileSize)
+
+	if err != nil {
+		// Invalid range, serve entire file
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		w.WriteHeader(http.StatusOK)
+		io.Copy(w, file)
+		return
+	}
+
+	// Seek to start position
+	if _, err := file.Seek(start, 0); err != nil {
+		http.Error(w, "Failed to seek file", http.StatusInternalServerError)
+		return
+	}
+
+	contentLength := end - start + 1
+
+	// Set Range-specific headers
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
+	w.WriteHeader(http.StatusPartialContent)
+
+	// Copy the requested range
+	io.CopyN(w, file, contentLength)
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !disabledXPoweredBy {
 		w.Header().Set("X-Powered-By", xPoweredByValue)
@@ -534,6 +652,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Check if this is valve.zip - serve with chunking support
+		if filepath.Base(p) == "valve.zip" {
+			serveFileChunked(w, r, path, fi)
+			return
+		}
+
+		// For other files, use standard serving
 		modTime := fi.ModTime().UTC()
 		w.Header().Set("Last-Modified", modTime.Format(http.TimeFormat))
 
