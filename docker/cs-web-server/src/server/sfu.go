@@ -589,6 +589,9 @@ func serveFileChunked(w http.ResponseWriter, r *http.Request, path string, fi os
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Content-Type", "application/zip")
 
+	// Add caching for valve.zip (1 day) - allows updates when file changes
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+
 	// Handle conditional requests
 	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
 		w.WriteHeader(http.StatusNotModified)
@@ -605,10 +608,28 @@ func serveFileChunked(w http.ResponseWriter, r *http.Request, path string, fi os
 
 	// Parse Range header
 	rangeHeader := r.Header.Get("Range")
+
+	// If no range header, serve the full file with 200 OK for better caching
+	if rangeHeader == "" {
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		w.WriteHeader(http.StatusOK)
+		io.Copy(w, file)
+		return
+	}
+
 	start, end, err := parseRange(rangeHeader, fileSize)
 
 	if err != nil {
-		// Invalid range, serve entire file
+		// Invalid range, serve entire file with 200 OK
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		w.WriteHeader(http.StatusOK)
+		io.Copy(w, file)
+		return
+	}
+
+	// If the range covers the entire file, serve as 200 OK instead of 206
+	// This helps with browser caching
+	if start == 0 && end == fileSize-1 {
 		w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
 		w.WriteHeader(http.StatusOK)
 		io.Copy(w, file)
@@ -623,7 +644,7 @@ func serveFileChunked(w http.ResponseWriter, r *http.Request, path string, fi os
 
 	contentLength := end - start + 1
 
-	// Set Range-specific headers
+	// Set Range-specific headers for partial content
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
 	w.WriteHeader(http.StatusPartialContent)
