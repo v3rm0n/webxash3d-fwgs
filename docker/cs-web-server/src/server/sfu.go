@@ -523,14 +523,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		websocketHandler(w, r)
 	default:
 		p := r.URL.Path
-		if r.URL.Path == "/" {
+		if p == "/" {
 			p = "index.html"
 		}
+
 		path := filepath.Join("public", p)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
+		fi, err := os.Stat(path)
+		if err != nil || os.IsNotExist(err) {
 			http.NotFound(w, r)
 			return
 		}
+
+		modTime := fi.ModTime().UTC()
+		w.Header().Set("Last-Modified", modTime.Format(http.TimeFormat))
+
+		etag := fmt.Sprintf(`"%x-%x"`, fi.ModTime().UnixNano(), fi.Size())
+		w.Header().Set("ETag", etag)
+
+		// Conditional requests
+		if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+
+		if since := r.Header.Get("If-Modified-Since"); since != "" {
+			if t, err := time.Parse(http.TimeFormat, since); err == nil &&
+				modTime.Before(t.Add(1*time.Second)) {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+
 		http.ServeFile(w, r, path)
 	}
 }
